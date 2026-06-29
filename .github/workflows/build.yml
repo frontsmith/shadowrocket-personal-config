@@ -6,8 +6,8 @@ on:
     branches: ["main"]
   schedule:
     # 每天北京时间 08:20 运行；避开整点，减少 GitHub Actions 高峰期延迟。
-    - cron: "20 8 * * *"
-      timezone: "Asia/Shanghai"
+    - cron: "20 0 * * *"
+
 
 permissions:
   contents: read
