@@ -5,9 +5,8 @@ on:
   push:
     branches: ["main"]
   schedule:
-    # 每天北京时间 08:20 运行；避开整点，减少 GitHub Actions 高峰期延迟。
+    # Every day 08:20 China Standard Time (00:20 UTC)
     - cron: "20 0 * * *"
-
 
 permissions:
   contents: read
@@ -15,7 +14,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "pages"
+  group: "shadowrocket-pages"
   cancel-in-progress: false
 
 jobs:
@@ -27,20 +26,26 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-
-      - name: Build config
+      - name: Run offline source checks
+        run: python -m unittest discover -s tests -v
+      - name: Build and validate config
         run: python build.py
-
+      - name: Confirm deployed file exists
+        run: test -s public/Front_Shadowrocket_personal.conf
+      - name: Keep successful build as workflow artifact (30 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadowrocket-config
+          path: public/Front_Shadowrocket_personal.conf
+          retention-days: 30
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
-
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
