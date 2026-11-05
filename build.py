@@ -1,230 +1,242 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Build Shadowrocket personal config by combining:
-1) johnshall upstream lazy_group.conf
-2) your personal proxy groups
-3) your personal priority rules
+"""Build Front's Shadowrocket config (v2.0, standard library only).
 
-Output:
-  public/Front_Shadowrocket_personal.conf
+Upstream supplies General/Host/URL Rewrite defaults, NOT upstream routing rules.
+Personal files define policies, deterministic routing order, and host overrides.
+A failed fetch or validation aborts before writing the publishable file.
 """
 
 from __future__ import annotations
 
-import datetime as _dt
+import datetime as dt
 import re
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
 UPSTREAM_URL = "https://johnshall.github.io/Shadowrocket-ADBlock-Rules-Forever/lazy_group.conf"
 ROOT = Path(__file__).resolve().parent
-PUBLIC = ROOT / "public"
-OUT = PUBLIC / "Front_Shadowrocket_personal.conf"
+OUT = ROOT / "public" / "Front_Shadowrocket_personal.conf"
+BUILTIN_POLICIES = {
+    "DIRECT", "PROXY", "REJECT", "REJECT-DROP", "REJECT-NO-DROP", "REJECT-200",
+    "REJECT-IMG", "REJECT-ARRAY", "REJECT-DICT", "REJECT-TINYGIF",
+    "REJECT-VIDEO", "TAILSCALE",
+}
+SUBSCRIPTIONS = {"VPS-US", "long"}
+GROUP_TYPES = {"fallback", "select", "url-test", "load-balance", "random"}
 
 
-def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
-
-
-def fetch(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "front-shadowrocket-builder/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = resp.read()
-    return data.decode("utf-8", errors="replace")
-
-
-def extract_section(text: str, name: str) -> str:
-    m = re.search(rf"^\[{re.escape(name)}\]\s*$", text, flags=re.M)
-    if not m:
+def section(source: str, name: str) -> str:
+    pattern = re.compile(r"^\[" + re.escape(name) + r"\]\s*$", re.MULTILINE)
+    match = pattern.search(source)
+    if not match:
         return ""
-    start = m.end()
-    m2 = re.search(r"^\[[^\]]+\]\s*$", text[start:], flags=re.M)
-    end = start + m2.start() if m2 else len(text)
-    return text[start:end].strip("\n")
+    following = re.search(r"^\[[^\]\r\n]+\]\s*$", source[match.end():], re.MULTILINE)
+    ending = match.end() + following.start() if following else len(source)
+    return source[match.end():ending].strip("\r\n")
 
 
-def parse_overrides(text: str) -> dict[str, str]:
+def active_lines(source: str) -> list[str]:
+    return [s.strip() for s in source.splitlines() if s.strip() and not s.lstrip().startswith(("#", ";"))]
+
+
+def read_kv(path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        result[k.strip()] = v.strip()
+    for line in active_lines(path.read_text(encoding="utf-8")):
+        if "=" not in line:
+            raise ValueError(f"Bad setting in {path}: {line}")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in result:
+            raise ValueError(f"Duplicate/empty setting in {path}: {key}")
+        result[key] = value.strip()
     return result
 
 
-def patch_general(upstream_general: str, overrides: dict[str, str]) -> str:
-    """Keep upstream General, but patch personal keys and remove update-url."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for raw in upstream_general.splitlines():
-        stripped = raw.strip()
-        if not stripped:
-            out.append(raw)
+def merge_general(upstream_general: str, overrides: dict[str, str]) -> str:
+    if not upstream_general or "dns-server" not in upstream_general:
+        raise ValueError("Upstream [General] missing or contains no dns-server")
+    output: list[str] = []
+    applied: set[str] = set()
+    for line in upstream_general.splitlines():
+        s = line.strip()
+        if not s or s.startswith(("#", ";")) or "=" not in line:
+            output.append(line)
             continue
-        if stripped.startswith("#"):
-            # Drop the upstream update-url comment too if it is next to old update-url? keep comments generally.
-            out.append(raw)
-            continue
-        if "=" not in raw:
-            out.append(raw)
-            continue
-        key = raw.split("=", 1)[0].strip()
+        key = line.split("=", 1)[0].strip()
         if key == "update-url":
-            out.append("# update-url disabled by personal build: do not overwrite this generated config with upstream original")
-            seen.add(key)
-            continue
-        if key in overrides:
-            out.append(f"{key} = {overrides[key]}")
-            seen.add(key)
+            output.append("# Removed upstream update-url to keep using personal Pages config")
+        elif key in overrides:
+            if key not in applied:
+                output.append(f"{key} = {overrides[key]}")
+                applied.add(key)
+            # Ignore any duplicate upstream instances of the same key.
         else:
-            out.append(raw)
+            output.append(line)
     for key, value in overrides.items():
-        if key not in seen:
-            out.append(f"{key} = {value}")
-    return "\n".join(out).strip() + "\n"
+        if key not in applied:
+            output.append(f"{key} = {value}")
+    return "\n".join(output).strip()
 
 
-def normalize_rule_line(line: str) -> str | None:
-    s = line.strip()
-    if not s or s.startswith("#"):
-        return None
-    if s.upper().startswith("FINAL,"):
-        return None
-
-    # Most Shadowrocket rules put the policy at the last comma field.
-    if "," not in s:
-        return s
-    head, policy = s.rsplit(",", 1)
-    policy = policy.strip()
-
-    exact_map = {
-        "YOUTUBE": "YouTube",
-        "TELEGRAM": "Telegram",
-        "TWITTER": "Twitter",
-        "谷歌服务": "Google",
-        "微软服务": "Microsoft",
-        "苹果服务": "Apple",
-        "NETFLIX": "GlobalMedia",
-        "DISNEY+": "GlobalMedia",
-        "MAX": "GlobalMedia",
-        "SPOTIFY": "GlobalMedia",
-        "TIKTOK": "GlobalMedia",
-        "FACEBOOK": "GlobalMedia",
-        "PAYPAL": "GlobalMedia",
-        "AMAZON": "GlobalMedia",
-        "游戏平台": "GlobalMedia",
-        "哔哩哔哩": "Domestic",
-    }
-    if policy in exact_map:
-        policy = exact_map[policy]
-    elif policy == "DIRECT":
-        # Keep LAN separate; map mainland app/rules to Domestic so you can manually switch if needed.
-        if "/Lan/" in s or "/Lan.list" in s:
-            policy = "LAN"
-        elif any(x in s for x in [
-            "/China/", "/Baidu/", "/DouBan/", "/WeChat/", "/Sina/", "/Zhihu/",
-            "/XiaoHongShu/", "/DouYin/", "/NetEaseMusic/", "/BiliBili/", "GEOIP,CN"
-        ]):
-            policy = "Domestic"
-    elif policy == "PROXY":
-        if "/GitHub/" in s:
-            policy = "GitHub"
-        elif "/Google/" in s:
-            policy = "Google"
-        else:
-            policy = "PROXY"
-
-    return f"{head},{policy}"
+def merge_hosts(upstream_hosts: str, personal_hosts: str) -> str:
+    replacements: dict[str, str] = {}
+    for line in active_lines(personal_hosts):
+        if "=" not in line:
+            raise ValueError("Invalid personal [Host] line: " + line)
+        key, value = [s.strip() for s in line.split("=", 1)]
+        if not key or not value or key in replacements:
+            raise ValueError("Duplicate/invalid personal [Host] key: " + key)
+        replacements[key] = value
+    result = []
+    for line in upstream_hosts.splitlines():
+        if "=" in line and not line.lstrip().startswith(("#", ";")):
+            key = line.split("=", 1)[0].strip()
+            if key in replacements:
+                continue
+        result.append(line)
+    result.extend(f"{k} = {v}" for k, v in replacements.items())
+    return "\n".join(result).strip()
 
 
-def build() -> None:
-    PUBLIC.mkdir(exist_ok=True)
-    upstream = fetch(UPSTREAM_URL)
+def parse_groups(proxy_groups: str) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    for line in active_lines(proxy_groups):
+        if "=" not in line:
+            raise ValueError("Invalid [Proxy Group] line: " + line)
+        name, definition = [v.strip() for v in line.split("=", 1)]
+        if name in groups or name in BUILTIN_POLICIES or not name:
+            raise ValueError("Duplicate or reserved proxy group: " + name)
+        values = [v.strip() for v in definition.split(",")]
+        if len(values) < 2 or values[0] not in GROUP_TYPES:
+            raise ValueError("Invalid proxy group definition: " + name)
+        groups[name] = values
+    if "AutoProxy" not in groups or "NAS服务" not in groups or "Final" not in groups:
+        raise ValueError("Missing required AutoProxy/NAS服务/Final group")
+    for name, entries in groups.items():
+        for entry in entries[1:]:
+            if "=" in entry:  # group options (url=, use=, policy-regex-filter=, ...)
+                continue
+            if entry not in groups and entry not in SUBSCRIPTIONS and entry not in BUILTIN_POLICIES:
+                raise ValueError(f"Unknown group member: {name} -> {entry}")
+    if "DIRECT" not in groups["NAS服务"][1:3]:
+        raise ValueError("NAS服务 must be DIRECT first")
+    if groups["Final"][1] != "AutoProxy":
+        raise ValueError("Final must select AutoProxy first")
+    if groups["AutoProxy"][0] != "fallback":
+        raise ValueError("AutoProxy must use fallback")
+    return groups
 
-    upstream_general = extract_section(upstream, "General")
-    upstream_rule = extract_section(upstream, "Rule")
-    upstream_host = extract_section(upstream, "Host")
-    upstream_rewrite = extract_section(upstream, "URL Rewrite")
 
-    proxy_group = read_text(ROOT / "personal" / "proxy_group.conf").strip() + "\n"
-    rule_top = read_text(ROOT / "personal" / "rule_top.conf").strip() + "\n"
-    overrides = parse_overrides(read_text(ROOT / "personal" / "general_overrides.ini"))
-    general = patch_general(upstream_general, overrides)
+def validate_rules(rules: str, groups: dict[str, list[str]]) -> None:
+    entries = active_lines(rules)
+    if any(line.upper().startswith("FINAL,") for line in entries):
+        raise ValueError("Do not put FINAL in personal rules; builder appends it")
+    if any("/QuantumultX/" in line or "/Global/Global.list" in line for line in entries):
+        raise ValueError("Found a foreign-format or oversized Global ruleset")
+    seen: dict[tuple[str, str], str] = {}
+    for line in entries:
+        fields = [x.strip() for x in line.split(",")]
+        if len(fields) < 3:
+            raise ValueError("Malformed routing rule: " + line)
+        kind, target, policy = fields[:3]
+        if kind not in {"DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "IP-CIDR", "IP-CIDR6", "RULE-SET", "DOMAIN-SET", "GEOIP"}:
+            raise ValueError("Unsupported rule type: " + kind)
+        if policy not in groups and policy not in BUILTIN_POLICIES:
+            raise ValueError(f"Undefined policy {policy}: {line}")
+        if kind == "RULE-SET" and not target.startswith("https://"):
+            raise ValueError("Rule-set must use HTTPS: " + line)
+        signature = kind, target.casefold()
+        if signature in seen and seen[signature] != policy:
+            raise ValueError(f"Conflicting routing rule: {signature} -> {seen[signature]}, {policy}")
+        seen[signature] = policy
+    if entries[0] != "DOMAIN-SUFFIX,198804.xyz,NAS服务":
+        raise ValueError("Private domain must be the first routing rule")
+    if "DOMAIN-SUFFIX,ts.net,TAILSCALE" not in entries:
+        raise ValueError("Missing Tailscale MagicDNS routing")
+    if "IP-CIDR,100.64.0.0/10,TAILSCALE,no-resolve" not in entries:
+        raise ValueError("Missing Tailscale IP routing")
+    if "GEOIP,CN,Domestic" not in entries:
+        raise ValueError("Missing China geoip fallback")
 
-    # Normalize upstream rule tail and remove exact duplicates already in rule_top.
-    personal_rule_set = {x.strip() for x in rule_top.splitlines() if x.strip() and not x.strip().startswith("#")}
-    normalized_tail: list[str] = []
-    seen: set[str] = set()
-    for raw in upstream_rule.splitlines():
-        n = normalize_rule_line(raw)
-        if not n:
-            continue
-        if n in personal_rule_set or n in seen:
-            continue
-        seen.add(n)
-        normalized_tail.append(n)
 
-    now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    content = []
-    content.append("# Shadowrocket Personal Config for Front")
-    content.append(f"# Auto-built at: {now}")
-    content.append(f"# Upstream: {UPSTREAM_URL}")
-    content.append("# Personal rules: VPS-US first; long only 美国/日本; 198804.xyz direct; MITM disabled.")
-    content.append("")
+def generate(upstream: str, root: Path = ROOT) -> str:
+    upstream_general = section(upstream, "General")
+    if not upstream_general or not section(upstream, "Rule"):
+        raise ValueError("Upstream is missing [General] or [Rule] - reject incomplete downloads")
+    overrides = read_kv(root / "personal" / "general_overrides.ini")
+    if overrides.get("dns-direct-system") != "true" or overrides.get("dns-direct-fallback-proxy") != "false":
+        raise ValueError("DIRECT DNS safeguards missing")
+    excluded = overrides.get("tun-excluded-routes", "")
+    if "100.64.0.0/10" in excluded:
+        raise ValueError("Tailscale 100.64.0.0/10 must not be TUN excluded")
+    groups_text = (root / "personal" / "proxy_group.conf").read_text(encoding="utf-8").strip()
+    rules_text = (root / "personal" / "rule_top.conf").read_text(encoding="utf-8").strip()
+    hosts_text = (root / "personal" / "host_overrides.conf").read_text(encoding="utf-8")
+    groups = parse_groups(groups_text)
+    validate_rules(rules_text, groups)
+    general = merge_general(upstream_general, overrides)
+    hosts = merge_hosts(section(upstream, "Host"), hosts_text)
+    rewrite = section(upstream, "URL Rewrite")
+    built = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    chunks = [
+        "# Front Shadowrocket Personal v2.0",
+        f"# Generated: {built}",
+        f"# General, Host and URL Rewrite upstream: {UPSTREAM_URL}",
+        "# All routing rules and policy groups are personal; built-in TAILSCALE is intentional.",
+        "", "[General]", general,
+        "", "[Proxy]", "# Nodes are provided by VPS-US and long subscriptions installed on the phone.",
+        "", "[Proxy Group]", groups_text,
+        "", "[Rule]", rules_text, "FINAL,Final",
+        "", "[Host]", hosts,
+    ]
+    if rewrite:
+        chunks.extend(["", "[URL Rewrite]", rewrite])
+    chunks.extend(["", "[MITM]", "enable = false", "hostname =", ""])
+    result = "\n".join(chunks)
+    # Check the effective assembled configuration as well.
+    if result.count("[Rule]") != 1 or active_lines(section(result, "Rule")).count("FINAL,Final") != 1:
+        raise ValueError("Duplicated rule section or FINAL")
+    if "198804.xyz = server:system" not in result or "*.198804.xyz = server:system" not in result:
+        raise ValueError("Private host DNS overrides missing")
+    return result
 
-    content.append("[General]")
-    content.append(general.strip())
-    content.append("")
 
-    content.append("[Proxy]")
-    content.append("# 本配置不内置节点。请在 Shadowrocket 中添加两个订阅，并确保订阅名称完全为：VPS-US、long。")
-    content.append("")
+def fetch_upstream(url: str = UPSTREAM_URL) -> str:
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "front-shadowrocket-builder/2.0"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = r.read()
+            return data.decode("utf-8")
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(attempt + 1)
+    raise AssertionError("unreachable")
 
-    content.append("[Proxy Group]")
-    content.append(proxy_group.strip())
-    content.append("")
 
-    content.append("[Rule]")
-    content.append(rule_top.strip())
-    content.append("")
-    content.append("# ==============================")
-    content.append("# 上游规则尾部：来自 johnshall lazy_group.conf，经策略组名称自动映射")
-    content.append("# ==============================")
-    content.extend(normalized_tail)
-    content.append("FINAL,Final")
-    content.append("")
-
-    if upstream_host:
-        content.append("[Host]")
-        content.append(upstream_host.strip())
-        content.append("")
-
-    if upstream_rewrite:
-        content.append("[URL Rewrite]")
-        content.append(upstream_rewrite.strip())
-        content.append("")
-
-    content.append("[MITM]")
-    content.append("# 个人长期使用建议关闭 HTTPS 解密。")
-    content.append("enable = false")
-    content.append("hostname =")
-    content.append("")
-
-    OUT.write_text("\n".join(content), encoding="utf-8")
-    (PUBLIC / "index.html").write_text(
-        """<!doctype html><html><head><meta charset=\"utf-8\"><title>Shadowrocket Config</title></head><body><h1>Shadowrocket Personal Config</h1><p><a href=\"Front_Shadowrocket_personal.conf\">Front_Shadowrocket_personal.conf</a></p></body></html>""",
-        encoding="utf-8",
+def main() -> None:
+    source = fetch_upstream()
+    built = generate(source, ROOT)
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    # Do not touch published output before every validation has succeeded.
+    OUT.write_text(built, encoding="utf-8")
+    (OUT.parent / "index.html").write_text(
+        '<!doctype html><html><meta charset="utf-8"><title>Front Shadowrocket</title>'
+        '<h1>Front Shadowrocket</h1><p><a href="Front_Shadowrocket_personal.conf">'
+        'Personal configuration</a></p></html>\n', encoding="utf-8"
     )
-    print(f"Wrote {OUT}")
+    print("[PASS] Generated and validated:", OUT)
+    print("[PASS] Sections: General / Proxy / Proxy Group / Rule / Host / MITM")
+    print("[PASS] 198804.xyz DIRECT-by-default; system DNS; Tailscale kept")
 
 
 if __name__ == "__main__":
     try:
-        build()
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        raise
+        main()
+    except Exception as exc:
+        print("[FAIL] No new configuration published: " + str(exc), file=sys.stderr)
+        sys.exit(1)

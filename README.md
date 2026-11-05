@@ -1,54 +1,59 @@
-# Shadowrocket Personal Config 自动合成模板
+# Front Shadowrocket Personal Config v2.0
 
-这个仓库用于自动生成个人版 Shadowrocket 配置：
+A minimal, reproducible Shadowrocket configuration for `VPS-US`, `long`, and private NAS services.
 
-- 上游基础配置：johnshall/Shadowrocket-ADBlock-Rules-Forever 的 `lazy_group.conf`
-- 个人策略：`personal/proxy_group.conf`
-- 个人优先规则：`personal/rule_top.conf`
-- General 覆盖项：`personal/general_overrides.ini`
-- 自动合成脚本：`build.py`
+## Inputs and output
 
-最终输出：
+| Path | Role |
+|---|---|
+| `personal/general_overrides.ini` | Overrides for upstream `[General]` |
+| `personal/host_overrides.conf` | System DNS for `198804.xyz` and its subdomains |
+| `personal/proxy_group.conf` | AutoProxy priority / selectable strategy groups |
+| `personal/rule_top.conf` | All personal routing rules, with no broad upstream rule tail |
+| `build.py` | Pulls upstream General/Host/URL Rewrite, then validates/assembles |
+| `tests/test_config.py` | Offline routing-intention and safety tests |
+| `.github/workflows/build.yml` | Daily 08:20 Beijing build, validation, Pages deploy, artifact backup |
+| `public/Front_Shadowrocket_personal.conf` | Generated output, published using GitHub Pages (not committed) |
 
-```text
-public/Front_Shadowrocket_personal.conf
+## Requirements on iPhone
+
+Two subscriptions must be added in Shadowrocket and named exactly:
+
+- `VPS-US` — node names: `vl-reality-Front-VPS.US`, `vm-argo-Front-VPS.US`, `vm-ws-Front-VPS.US`, `anytls-Front-VPS.US`
+- `long` — fallback nodes have `美国` or `日本` in their names
+
+Strategy: `AutoProxy`: four `VPS-US` entries (in that order), then `long` USA / Japan.
+
+**Private domain:** `198804.xyz` and subdomains are routed to `NAS服务`, which defaults to `DIRECT`. System DNS is requested via `[Host]` entries. You can manually change `NAS服务` if needed. DNS resolution/connection behavior still needs device testing; it cannot be guaranteed by static tests alone.
+
+**Tailscale:** `.ts.net` and `100.64.0.0/10` use built-in `TAILSCALE`. Do not put `100.64.0.0/10` into `tun-excluded-routes`. Ensure the Shadowrocket Tailscale module is configured and active if using these rules.
+
+**Privacy:** MITM is disabled; no scripts. `block-quic = all-proxy` does not affect direct-domain QUIC.
+
+## Building and checking
+
+```bash
+python -m unittest discover -s tests -v
+python build.py
 ```
 
-GitHub Actions 会在以下情况自动运行：
+When validation fails, `build.py` exits nonzero and GitHub Actions does not deploy a new Pages configuration. The previous successful Pages deployment remains the last published version.
 
-- 手动点击运行
-- push 到 main 分支
-- 每天北京时间 08:20 自动运行
+The build preserves upstream `[General]`, `[Host]` and `[URL Rewrite]`, subject to personal overrides; it deliberately **does not append upstream `[Rule]`** to avoid third-party strategy-name drift and oversized mixed-format Global rules.
 
-## 使用前确认
+### Upgrade and rollback
 
-Shadowrocket 里两个订阅名称必须完全一致：
+Make changes on a temporary branch first. Confirm workflow success, merge into main, wait for Pages deployment, then refresh the configuration on iPhone. If behavior changes unexpectedly, use GitHub's commit history to revert the upgrade and redeploy; no subscription names or URLs need to change.
 
-```text
-VPS-US
-long
-```
+### Acceptance check on iPhone
 
-long 订阅里可被自动备用的节点名必须包含：
+Use "配置" routing mode. Verify rule tests and logs for:
 
-```text
-美国
-日本
-```
+- `198804.xyz` / `sub.198804.xyz`: `NAS服务` -> `DIRECT` with system DNS
+- `x.com`: `Twitter` -> `AutoProxy`
+- `chatgpt.com`: `AI` -> `AutoProxy`
+- `weixin.com`: `Domestic` -> `DIRECT`
+- `.ts.net` and Tailscale IPs: `TAILSCALE` (if enabled)
+- MITM: disabled
 
-## 个人配置重点
-
-代理优先级：
-
-```text
-vl-reality-Front-VPS.US
-→ vm-argo-Front-VPS.US
-→ vm-ws-Front-VPS.US
-→ anytls-Front-VPS.US
-→ long 美国节点
-→ long 日本节点
-```
-
-`198804.xyz` 默认直连，可手动切代理。
-
-MITM 默认关闭。
+If `198804.xyz` is still unstable with correct DIRECT logging, compare Wi-Fi vs mobile data, A/AAAA resolution, and Cloudflare Tunnel/server logs; configuration is not necessarily the root cause.
